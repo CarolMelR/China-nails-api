@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'database_connection.php';
+
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS');
 header('Access-Control-Allow-Headers: Accept, Content-Type, Authorization');
@@ -20,44 +22,6 @@ function respond(array $data, int $status = 200): never
 function fail_request(int $status, string $message): never
 {
     throw new ApiException($message, $status);
-}
-
-function database_connection(): mysqli
-{
-    $host = getenv('CN_DB_HOST') ?: '';
-    $port = (int) (getenv('CN_DB_PORT') ?: '0');
-    $username = getenv('CN_DB_USER') ?: '';
-    $password = getenv('CN_DB_PASSWORD') ?: '';
-    $databaseName = getenv('CN_DB_NAME') ?: '';
-    $caCertificatePath = getenv('CN_DB_SSL_CA') ?: '';
-
-    if (
-        $host === '' ||
-        $port < 1 ||
-        $username === '' ||
-        $password === '' ||
-        $databaseName === '' ||
-        !is_file($caCertificatePath)
-    ) {
-        fail_request(500, 'La conexión a la base de datos no está configurada.');
-    }
-
-    mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
-    $connection = mysqli_init();
-    $connection->options(MYSQLI_OPT_CONNECT_TIMEOUT, 10);
-    $connection->options(MYSQLI_OPT_SSL_VERIFY_SERVER_CERT, true);
-    $connection->ssl_set(null, null, $caCertificatePath, null, null);
-    $connection->real_connect(
-        $host,
-        $username,
-        $password,
-        $databaseName,
-        $port,
-        null,
-        MYSQLI_CLIENT_SSL
-    );
-    $connection->set_charset('utf8mb4');
-    return $connection;
 }
 
 function read_request_body(): array
@@ -206,7 +170,7 @@ $connection = null;
 $appointmentLock = null;
 
 try {
-    $connection = database_connection();
+    $connection = china_nails_database_connection();
 
     if ($route === '/health' && $method === 'GET') {
         $connection->query('SELECT 1');
@@ -1001,6 +965,8 @@ try {
     }
 
     fail_request(404, 'No se encontró el recurso solicitado.');
+} catch (ChinaNailsDatabaseConfigurationException $error) {
+    respond(['message' => $error->getMessage()], 500);
 } catch (ApiException $error) {
     if ($connection instanceof mysqli) {
         try {
@@ -1022,7 +988,9 @@ try {
             error_log('China Nails API transaction rollback failed: ' . $rollbackError->getMessage());
         }
     }
-    error_log('China Nails PHP API request failed: ' . $error->getMessage());
+    if (!($error instanceof ChinaNailsDatabaseConnectionException)) {
+        error_log('China Nails PHP API request failed: ' . $error->getMessage());
+    }
     respond([
         'message' => 'Ocurrió un error interno. Revisa la conexión y los registros de Apache.',
     ], 500);
