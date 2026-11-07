@@ -233,6 +233,7 @@ function calculate_booking_services_quote(mysqli $connection, mixed $services): 
     $quotes = [];
     $totalPrice = 0;
     $totalDuration = 0;
+    $totalEffectNails = 0;
     $noteParts = [];
     foreach ($services as $index => $service) {
         if (
@@ -252,6 +253,12 @@ function calculate_booking_services_quote(mysqli $connection, mixed $services): 
             $service['effects'],
             $service['removal']
         );
+        foreach ($service['effects'] as $effect) {
+            $totalEffectNails += $effect['count'];
+            if ($totalEffectNails > 10) {
+                fail_request(400, 'La decoración puede cubrir como máximo 10 uñas entre todos los servicios.');
+            }
+        }
         $technique = CHINA_NAILS_CATALOG['techniques'][$quote['serviceCode']];
         $quotes[] = $quote;
         $totalPrice += $quote['total'];
