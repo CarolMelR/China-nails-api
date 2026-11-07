@@ -2,6 +2,9 @@
 declare(strict_types=1);
 
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'database_connection.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'catalogo.php';
+
+date_default_timezone_set(CHINA_NAILS_CATALOG['schedule']['timezone']);
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS');
@@ -118,15 +121,215 @@ function require_role(array $user, string $role): void
     }
 }
 
+function catalog_service(mysqli $connection, string $serviceCode): array
+{
+    $techniques = CHINA_NAILS_CATALOG['techniques'];
+    if (!isset($techniques[$serviceCode])) {
+        fail_request(404, 'La técnica seleccionada no está disponible.');
+    }
+
+    $statement = $connection->prepare(
+        'SELECT codigo_servicio FROM servicios
+         WHERE codigo_servicio = ? AND activo = TRUE LIMIT 1'
+    );
+    $statement->bind_param('s', $serviceCode);
+    $statement->execute();
+    if (!$statement->get_result()->fetch_assoc()) {
+        fail_request(404, 'La técnica seleccionada ya no está disponible.');
+    }
+
+    return $techniques[$serviceCode];
+}
+
+function calculate_booking_quote(
+    mysqli $connection,
+    mixed $serviceCode,
+    mixed $length,
+    mixed $effects,
+    mixed $removal
+): array {
+    if (!is_string($serviceCode) || !is_array($effects) || !is_bool($removal)) {
+        fail_request(400, 'La selección del servicio está incompleta o no es válida.');
+    }
+    $technique = catalog_service($connection, $serviceCode);
+
+    if ($technique['usesLength']) {
+        if (!is_int($length) || $length < 1 || $length > 8) {
+            fail_request(400, 'Selecciona un largo válido del 1 al 8.');
+        }
+        $basePrice = CHINA_NAILS_CATALOG['lengths'][$length][$serviceCode];
+    } else {
+        if ($length !== null) {
+            fail_request(400, 'Esta técnica no permite seleccionar largo.');
+        }
+        $basePrice = $technique['price'];
+    }
+
+    $effectPrices = [];
+    foreach (CHINA_NAILS_CATALOG['effects'] as $price => $options) {
+        foreach ($options as $option) {
+            $effectPrices[$option['id']] = [
+                'name' => $option['name'],
+                'price' => (int) $price,
+            ];
+        }
+    }
+
+    $seenEffects = [];
+    $effectTotal = 0;
+    $effectNotes = [];
+    foreach ($effects as $effect) {
+        if (
+            !is_array($effect) ||
+            !isset($effect['id'], $effect['count']) ||
+            !is_string($effect['id']) ||
+            !is_int($effect['count']) ||
+            $effect['count'] < 0 ||
+            $effect['count'] > 10 ||
+            !isset($effectPrices[$effect['id']]) ||
+            isset($seenEffects[$effect['id']])
+        ) {
+            fail_request(400, 'Revisa los efectos seleccionados y su cantidad de uñas.');
+        }
+        $seenEffects[$effect['id']] = true;
+        if ($effect['count'] > 0) {
+            $effectTotal += $effectPrices[$effect['id']]['price'] * $effect['count'];
+            $effectNotes[] = $effectPrices[$effect['id']]['name'] . ' x' . $effect['count'];
+        }
+    }
+
+    $removalConfig = CHINA_NAILS_CATALOG['removals'][$serviceCode];
+    $removalPrice = $removal ? $removalConfig['price'] : 0;
+    $duration = $technique['durationMinutes']
+        + ($removal ? $removalConfig['durationMinutes'] : 0);
+    $noteParts = [];
+    if ($technique['usesLength']) {
+        $noteParts[] = 'Largo ' . $length;
+    }
+    if ($effectNotes !== []) {
+        $noteParts[] = implode(', ', $effectNotes);
+    }
+    if ($removal) {
+        $noteParts[] = 'Con retiro';
+    }
+
+    return [
+        'serviceCode' => $serviceCode,
+        'durationMinutes' => $duration,
+        'basePrice' => $basePrice,
+        'effectsPrice' => $effectTotal,
+        'removalPrice' => $removalPrice,
+        'total' => $basePrice + $effectTotal + $removalPrice,
+        'notes' => $noteParts === [] ? null : implode(' | ', $noteParts),
+    ];
+}
+
+function selection_from_query(): array
+{
+    $serviceCode = $_GET['serviceCode'] ?? null;
+    $rawLength = $_GET['length'] ?? null;
+    $rawEffects = $_GET['effects'] ?? '[]';
+    $rawRemoval = $_GET['removal'] ?? null;
+    if (
+        !is_string($serviceCode) ||
+        ($rawLength !== null && (!is_string($rawLength) || !preg_match('/^[1-8]$/', $rawLength))) ||
+        !is_string($rawEffects) ||
+        !in_array($rawRemoval, ['true', 'false'], true)
+    ) {
+        fail_request(400, 'Indica una selección de servicio válida para consultar disponibilidad.');
+    }
+
+    $effects = json_decode($rawEffects, true);
+    if (!is_array($effects)) {
+        fail_request(400, 'La lista de efectos no es válida.');
+    }
+
+    return [
+        'serviceCode' => $serviceCode,
+        'length' => $rawLength === null ? null : (int) $rawLength,
+        'effects' => $effects,
+        'removal' => $rawRemoval === 'true',
+    ];
+}
+
+function mexico_datetime(string $date, string $time = '00:00'): ?DateTimeImmutable
+{
+    $timezone = new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone']);
+    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d H:i', "$date $time", $timezone);
+    return $parsed && $parsed->format('Y-m-d H:i') === "$date $time" ? $parsed : null;
+}
+
+function appointment_service_finished(string $date, string $time, int $durationMinutes): bool
+{
+    $start = mexico_datetime($date, $time);
+    if ($start === null) {
+        return false;
+    }
+    return $start->modify("+$durationMinutes minutes") <= new DateTimeImmutable(
+        'now',
+        new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone'])
+    );
+}
+
+function business_slots(string $date, int $durationMinutes, array $appointments): array
+{
+    $day = mexico_datetime($date);
+    if ($day === null) {
+        fail_request(400, 'Indica una fecha válida.');
+    }
+    $schedule = CHINA_NAILS_CATALOG['schedule'];
+    $now = new DateTimeImmutable('now', new DateTimeZone($schedule['timezone']));
+    if (
+        !in_array((int) $day->format('N'), $schedule['days'], true) ||
+        $date < $now->format('Y-m-d')
+    ) {
+        return ['available' => [], 'total' => 0];
+    }
+
+    [$openHour, $openMinute] = array_map('intval', explode(':', $schedule['openingTime']));
+    [$closeHour, $closeMinute] = array_map('intval', explode(':', $schedule['closingTime']));
+    $open = $openHour * 60 + $openMinute;
+    $close = $closeHour * 60 + $closeMinute;
+    $currentMinute = ((int) $now->format('H')) * 60 + (int) $now->format('i');
+    $available = [];
+    $total = 0;
+
+    for (
+        $startMinute = $open;
+        $startMinute + $durationMinutes <= $close;
+        $startMinute += $schedule['slotMinutes']
+    ) {
+        if ($date === $now->format('Y-m-d') && $startMinute <= $currentMinute) {
+            continue;
+        }
+        $total++;
+        $slotStart = $startMinute * 60;
+        $slotEnd = ($startMinute + $durationMinutes) * 60;
+        $overlaps = false;
+        foreach ($appointments as $appointment) {
+            $appointmentStart = (int) $appointment['startSeconds'];
+            $appointmentEnd = $appointmentStart + (int) $appointment['durationMinutes'] * 60;
+            if ($appointmentStart < $slotEnd && $appointmentEnd > $slotStart) {
+                $overlaps = true;
+                break;
+            }
+        }
+        if (!$overlaps) {
+            $available[] = sprintf('%02d:%02d', intdiv($startMinute, 60), $startMinute % 60);
+        }
+    }
+
+    return ['available' => $available, 'total' => $total];
+}
+
 function appointment_rows(mysqli $connection, string $where, string $types, array $values): array
 {
     $statement = $connection->prepare(
         "SELECT a.id_cita AS id, a.fecha_cita AS date,
                 TIME_FORMAT(a.hora_inicio, '%H:%i') AS time,
                 a.duracion_minutos AS durationMinutes,
-                (TIMESTAMP(a.fecha_cita, a.hora_inicio) +
-                 INTERVAL a.duracion_minutos MINUTE <= NOW()) AS serviceFinished,
                 a.precio_reservado AS price, a.estado AS status,
+                a.notas AS notes,
                 pago.monto AS amountPaid, pago.metodo_pago AS paymentMethod,
                 s.nombre AS service, u.nombre_completo AS clientName,
                 u.telefono AS phone
@@ -146,7 +349,12 @@ function appointment_rows(mysqli $connection, string $where, string $types, arra
     foreach ($rows as &$row) {
         $row['id'] = (string) $row['id'];
         $row['durationMinutes'] = (int) $row['durationMinutes'];
-        $row['serviceFinished'] = (bool) $row['serviceFinished'];
+        $row['serviceFinished'] = appointment_service_finished(
+            (string) $row['date'],
+            (string) $row['time'],
+            $row['durationMinutes']
+        );
+        $row['notes'] = $row['notes'] === null ? null : (string) $row['notes'];
         $row['price'] = (float) $row['price'];
         $row['amountPaid'] = $row['amountPaid'] === null
             ? null
@@ -441,6 +649,53 @@ try {
         ], 201);
     }
 
+    if ($route === '/catalog' && $method === 'GET') {
+        $result = $connection->query(
+            'SELECT codigo_servicio FROM servicios WHERE activo = TRUE'
+        );
+        $activeCodes = [];
+        foreach ($result->fetch_all(MYSQLI_ASSOC) as $row) {
+            $activeCodes[strtoupper((string) $row['codigo_servicio'])] = true;
+        }
+
+        $techniques = [];
+        foreach (CHINA_NAILS_CATALOG['techniques'] as $code => $technique) {
+            if (!isset($activeCodes[$code])) {
+                continue;
+            }
+            $lengthPrices = [];
+            foreach (CHINA_NAILS_CATALOG['lengths'] as $length => $prices) {
+                if (isset($prices[$code])) {
+                    $lengthPrices[] = [
+                        'length' => (int) $length,
+                        'price' => $prices[$code],
+                    ];
+                }
+            }
+            $techniques[] = [
+                'serviceCode' => $code,
+                'name' => $technique['name'],
+                'description' => $technique['description'],
+                'durationMinutes' => $technique['durationMinutes'],
+                'usesLength' => $technique['usesLength'],
+                'price' => $technique['usesLength']
+                    ? $lengthPrices[0]['price']
+                    : $technique['price'],
+                'lengthPrices' => $lengthPrices,
+            ];
+        }
+        $effects = [];
+        foreach (CHINA_NAILS_CATALOG['effects'] as $price => $options) {
+            $effects[] = ['price' => (int) $price, 'options' => $options];
+        }
+        respond([
+            'techniques' => $techniques,
+            'effectsByPrice' => $effects,
+            'removals' => CHINA_NAILS_CATALOG['removals'],
+            'schedule' => CHINA_NAILS_CATALOG['schedule'],
+        ]);
+    }
+
     if ($route === '/services' && $method === 'GET') {
         $result = $connection->query(
             "SELECT codigo_servicio AS serviceCode, nombre AS name,
@@ -577,29 +832,17 @@ try {
 
         if ($route === '/appointments/availability' && $method === 'GET') {
             $date = $_GET['date'] ?? '';
-            $serviceCode = $_GET['serviceCode'] ?? '';
-            $parsedDate = is_string($date)
-                ? DateTimeImmutable::createFromFormat('!Y-m-d', $date)
-                : false;
-            if (
-                !$parsedDate ||
-                $parsedDate->format('Y-m-d') !== $date ||
-                !is_string($serviceCode) ||
-                $serviceCode === ''
-            ) {
+            if (!is_string($date) || mexico_datetime($date) === null) {
                 fail_request(400, 'Indica una fecha y servicio válidos.');
             }
-            $statement = $connection->prepare(
-                "SELECT duracion_minutos
-                 FROM servicios WHERE codigo_servicio = ? AND activo = TRUE LIMIT 1"
+            $selection = selection_from_query();
+            $quote = calculate_booking_quote(
+                $connection,
+                $selection['serviceCode'],
+                $selection['length'],
+                $selection['effects'],
+                $selection['removal']
             );
-            $statement->bind_param('s', $serviceCode);
-            $statement->execute();
-            $service = $statement->get_result()->fetch_assoc();
-            if (!$service) {
-                fail_request(404, 'El servicio seleccionado ya no está disponible.');
-            }
-            $serviceDuration = (int) $service['duracion_minutos'];
             $statement = $connection->prepare(
                 "SELECT TIME_TO_SEC(hora_inicio) AS startSeconds,
                         duracion_minutos AS durationMinutes
@@ -609,47 +852,29 @@ try {
             $statement->bind_param('s', $date);
             $statement->execute();
             $rows = $statement->get_result()->fetch_all(MYSQLI_ASSOC);
-            $reservedTimes = [];
-            foreach (['10:00', '11:30', '13:00', '15:00', '16:30'] as $slot) {
-                [$hour, $minute] = array_map('intval', explode(':', $slot));
-                $slotStart = $hour * 3600 + $minute * 60;
-                $slotEnd = $slotStart + $serviceDuration * 60;
-                foreach ($rows as $appointment) {
-                    $appointmentStart = (int) $appointment['startSeconds'];
-                    $appointmentEnd =
-                        $appointmentStart + (int) $appointment['durationMinutes'] * 60;
-                    if ($appointmentStart < $slotEnd && $appointmentEnd > $slotStart) {
-                        $reservedTimes[] = $slot;
-                        break;
-                    }
-                }
-            }
-            respond(['reservedTimes' => $reservedTimes]);
+            $slots = business_slots($date, $quote['durationMinutes'], $rows);
+            respond([
+                'availableTimes' => $slots['available'],
+                'totalSlots' => $slots['total'],
+            ]);
         }
 
         if ($route === '/appointments/calendar' && $method === 'GET') {
             $month = $_GET['month'] ?? '';
-            $serviceCode = $_GET['serviceCode'] ?? '';
-            if (
-                !is_string($month) ||
-                !preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month) ||
-                !is_string($serviceCode) ||
-                $serviceCode === ''
-            ) {
+            if (!is_string($month) || !preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month)) {
                 fail_request(400, 'Indica un mes y servicio válidos.');
             }
-            $statement = $connection->prepare(
-                "SELECT duracion_minutos
-                 FROM servicios WHERE codigo_servicio = ? AND activo = TRUE LIMIT 1"
+            $selection = selection_from_query();
+            $quote = calculate_booking_quote(
+                $connection,
+                $selection['serviceCode'],
+                $selection['length'],
+                $selection['effects'],
+                $selection['removal']
             );
-            $statement->bind_param('s', $serviceCode);
-            $statement->execute();
-            $service = $statement->get_result()->fetch_assoc();
-            if (!$service) {
-                fail_request(404, 'El servicio seleccionado ya no está disponible.');
-            }
 
-            $monthStart = new DateTimeImmutable("$month-01");
+            $timezone = new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone']);
+            $monthStart = new DateTimeImmutable("$month-01", $timezone);
             $nextMonth = $monthStart->modify('+1 month')->format('Y-m-d');
             $monthStartKey = $monthStart->format('Y-m-d');
             $statement = $connection->prepare(
@@ -667,37 +892,27 @@ try {
                 $appointmentsByDate[$appointment['appointmentDate']][] = $appointment;
             }
 
-            $serviceDuration = (int) $service['duracion_minutos'];
             $daysInMonth = (int) $monthStart->format('t');
             $availableTimesByDate = [];
+            $totalSlotsByDate = [];
             for ($day = 1; $day <= $daysInMonth; $day++) {
                 $dateKey = $monthStart->setDate(
                     (int) $monthStart->format('Y'),
                     (int) $monthStart->format('m'),
                     $day
                 )->format('Y-m-d');
-                $availableTimes = [];
-                foreach (['10:00', '11:30', '13:00', '15:00', '16:30'] as $slot) {
-                    [$hour, $minute] = array_map('intval', explode(':', $slot));
-                    $slotStart = $hour * 3600 + $minute * 60;
-                    $slotEnd = $slotStart + $serviceDuration * 60;
-                    $overlaps = false;
-                    foreach ($appointmentsByDate[$dateKey] ?? [] as $appointment) {
-                        $appointmentStart = (int) $appointment['startSeconds'];
-                        $appointmentEnd =
-                            $appointmentStart + (int) $appointment['durationMinutes'] * 60;
-                        if ($appointmentStart < $slotEnd && $appointmentEnd > $slotStart) {
-                            $overlaps = true;
-                            break;
-                        }
-                    }
-                    if (!$overlaps) {
-                        $availableTimes[] = $slot;
-                    }
-                }
-                $availableTimesByDate[$dateKey] = $availableTimes;
+                $slots = business_slots(
+                    $dateKey,
+                    $quote['durationMinutes'],
+                    $appointmentsByDate[$dateKey] ?? []
+                );
+                $availableTimesByDate[$dateKey] = $slots['available'];
+                $totalSlotsByDate[$dateKey] = $slots['total'];
             }
-            respond(['availableTimesByDate' => $availableTimesByDate]);
+            respond([
+                'availableTimesByDate' => $availableTimesByDate,
+                'totalSlotsByDate' => $totalSlotsByDate,
+            ]);
         }
 
         if ($route === '/appointments/mine' && $method === 'GET') {
@@ -779,10 +994,10 @@ try {
             $amount = round((float) $amountValue, 2);
             $connection->begin_transaction();
             $statement = $connection->prepare(
-                'SELECT estado,
-                        (TIMESTAMP(fecha_cita, hora_inicio) +
-                         INTERVAL duracion_minutos MINUTE <= NOW()) AS service_finished
-                 FROM citas WHERE id_cita = ? FOR UPDATE'
+                "SELECT estado, fecha_cita AS date,
+                        TIME_FORMAT(hora_inicio, '%H:%i') AS time,
+                        duracion_minutos AS durationMinutes
+                 FROM citas WHERE id_cita = ? FOR UPDATE"
             );
             $statement->bind_param('i', $appointmentId);
             $statement->execute();
@@ -795,7 +1010,11 @@ try {
                 $connection->rollback();
                 fail_request(409, 'La cita ya fue completada o cancelada.');
             }
-            if ((int) $appointment['service_finished'] !== 1) {
+            if (!appointment_service_finished(
+                (string) $appointment['date'],
+                (string) $appointment['time'],
+                (int) $appointment['durationMinutes']
+            )) {
                 $connection->rollback();
                 fail_request(409, 'La cita solo se puede completar cuando termine el servicio.');
             }
@@ -875,26 +1094,32 @@ try {
             $serviceCode = $body['serviceCode'] ?? null;
             $date = $body['date'] ?? null;
             $time = $body['time'] ?? null;
-            $timeSlots = ['10:00', '11:30', '13:00', '15:00', '16:30'];
-            $parsedDate = is_string($date)
-                ? DateTimeImmutable::createFromFormat('!Y-m-d', $date)
-                : false;
             if (
                 !is_string($serviceCode) ||
-                !$parsedDate ||
-                $parsedDate->format('Y-m-d') !== $date ||
+                !is_string($date) ||
+                mexico_datetime($date) === null ||
                 !is_string($time) ||
-                !in_array($time, $timeSlots, true)
+                !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $time) ||
+                !array_key_exists('removal', $body)
             ) {
                 fail_request(400, 'Selecciona un servicio, fecha y horario válidos.');
             }
-
-            $statement = $connection->prepare(
-                "SELECT DATE_FORMAT(CURDATE(), '%Y-%m-%d') AS today"
+            $quote = calculate_booking_quote(
+                $connection,
+                $serviceCode,
+                $body['length'] ?? null,
+                $body['effects'] ?? null,
+                $body['removal']
             );
-            $statement->execute();
-            if ($date < $statement->get_result()->fetch_assoc()['today']) {
+            $now = new DateTimeImmutable(
+                'now',
+                new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone'])
+            );
+            if ($date < $now->format('Y-m-d')) {
                 fail_request(400, 'La fecha de la cita no puede ser anterior a hoy.');
+            }
+            if (!in_array($time, business_slots($date, $quote['durationMinutes'], [])['available'], true)) {
+                fail_request(400, 'Ese horario no está dentro del horario de atención para la duración seleccionada.');
             }
 
             $appointmentLock = 'china-nails:' . $date;
@@ -908,31 +1133,19 @@ try {
 
             $connection->begin_transaction();
             $statement = $connection->prepare(
-                "SELECT codigo_servicio AS service_code,
-                        duracion_minutos AS duration_minutes, precio AS price
-                 FROM servicios
-                 WHERE codigo_servicio = ? AND activo = TRUE LIMIT 1"
+                "SELECT TIME_TO_SEC(hora_inicio) AS startSeconds,
+                        duracion_minutos AS durationMinutes
+                 FROM citas
+                 WHERE fecha_cita = ? AND estado IN ('pending', 'confirmed')"
             );
-            $statement->bind_param('s', $serviceCode);
+            $statement->bind_param('s', $date);
             $statement->execute();
-            $service = $statement->get_result()->fetch_assoc();
-            if (!$service) {
-                $connection->rollback();
-                fail_request(404, 'El servicio seleccionado ya no está disponible.');
-            }
-
-            $statement = $connection->prepare(
-                "SELECT id_cita FROM citas
-                 WHERE fecha_cita = ?
-                   AND estado IN ('pending', 'confirmed')
-                   AND TIME_TO_SEC(hora_inicio) < TIME_TO_SEC(?) + ? * 60
-                   AND TIME_TO_SEC(hora_inicio) + duracion_minutos * 60 > TIME_TO_SEC(?)
-                 LIMIT 1"
-            );
-            $duration = (int) $service['duration_minutes'];
-            $statement->bind_param('ssis', $date, $time, $duration, $time);
-            $statement->execute();
-            if ($statement->get_result()->fetch_assoc()) {
+            $appointments = $statement->get_result()->fetch_all(MYSQLI_ASSOC);
+            if (!in_array(
+                $time,
+                business_slots($date, $quote['durationMinutes'], $appointments)['available'],
+                true
+            )) {
                 $connection->rollback();
                 fail_request(409, 'Ese horario ya no está disponible. Elige otro.');
             }
@@ -940,18 +1153,19 @@ try {
             $statement = $connection->prepare(
                 "INSERT INTO citas
                    (id_clienta, codigo_servicio, fecha_cita, hora_inicio,
-                    duracion_minutos, precio_reservado)
-                 VALUES (?, ?, ?, ?, ?, ?)"
+                    duracion_minutos, precio_reservado, notas)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
             );
-            $price = (float) $service['price'];
+            $price = (float) $quote['total'];
             $statement->bind_param(
-                'isssid',
+                'isssids',
                 $userId,
-                $service['service_code'],
+                $serviceCode,
                 $date,
                 $time,
-                $duration,
-                $price
+                $quote['durationMinutes'],
+                $price,
+                $quote['notes']
             );
             $statement->execute();
             $appointmentId = (string) $connection->insert_id;
