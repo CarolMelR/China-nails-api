@@ -224,8 +224,94 @@ function calculate_booking_quote(
     ];
 }
 
+function calculate_booking_services_quote(mysqli $connection, mixed $services): array
+{
+    if (!is_array($services) || count($services) < 1 || count($services) > 3) {
+        fail_request(400, 'Selecciona de uno a tres servicios por cita.');
+    }
+
+    $quotes = [];
+    $totalPrice = 0;
+    $totalDuration = 0;
+    $noteParts = [];
+    foreach ($services as $index => $service) {
+        if (
+            !is_array($service) ||
+            !array_key_exists('serviceCode', $service) ||
+            !array_key_exists('length', $service) ||
+            !array_key_exists('effects', $service) ||
+            !array_key_exists('removal', $service)
+        ) {
+            fail_request(400, 'Cada servicio debe incluir técnica, largo, efectos y retiro.');
+        }
+
+        $quote = calculate_booking_quote(
+            $connection,
+            $service['serviceCode'],
+            $service['length'],
+            $service['effects'],
+            $service['removal']
+        );
+        $technique = CHINA_NAILS_CATALOG['techniques'][$quote['serviceCode']];
+        $quotes[] = $quote;
+        $totalPrice += $quote['total'];
+        $totalDuration += $quote['durationMinutes'];
+
+        $details = [];
+        if ($technique['usesLength']) {
+            $details[] = 'Largo ' . $service['length'];
+        }
+        foreach ($service['effects'] as $effect) {
+            if ($effect['count'] > 0) {
+                $effectName = '';
+                foreach (CHINA_NAILS_CATALOG['effects'] as $options) {
+                    foreach ($options as $option) {
+                        if ($option['id'] === $effect['id']) {
+                            $effectName = $option['name'];
+                            break 2;
+                        }
+                    }
+                }
+                $details[] = $effectName . ' x' . $effect['count'];
+            }
+        }
+        if ($service['removal']) {
+            $details[] = 'Con retiro';
+        }
+        if ($index === 0) {
+            if ($details !== []) {
+                $noteParts[] = implode(', ', $details);
+            }
+        } else {
+            $noteParts[] = $technique['name'] . (
+                $details === [] ? '' : ' (' . implode(', ', $details) . ')'
+            );
+        }
+    }
+
+    return [
+        'quotes' => $quotes,
+        'durationMinutes' => $totalDuration,
+        'total' => $totalPrice,
+        'notes' => $noteParts === []
+            ? null
+            : mb_substr(implode('; ', $noteParts), 0, 1000, 'UTF-8'),
+    ];
+}
+
 function selection_from_query(): array
 {
+    if (isset($_GET['services'])) {
+        if (!is_string($_GET['services'])) {
+            fail_request(400, 'La selección de servicios no es válida.');
+        }
+        $services = json_decode($_GET['services'], true);
+        if (!is_array($services)) {
+            fail_request(400, 'La selección de servicios no es válida.');
+        }
+        return ['services' => $services];
+    }
+
     $serviceCode = $_GET['serviceCode'] ?? null;
     $rawLength = $_GET['length'] ?? null;
     $rawEffects = $_GET['effects'] ?? '[]';
@@ -245,10 +331,12 @@ function selection_from_query(): array
     }
 
     return [
-        'serviceCode' => $serviceCode,
-        'length' => $rawLength === null ? null : (int) $rawLength,
-        'effects' => $effects,
-        'removal' => $rawRemoval === 'true',
+        'services' => [[
+            'serviceCode' => $serviceCode,
+            'length' => $rawLength === null ? null : (int) $rawLength,
+            'effects' => $effects,
+            'removal' => $rawRemoval === 'true',
+        ]],
     ];
 }
 
@@ -836,13 +924,7 @@ try {
                 fail_request(400, 'Indica una fecha y servicio válidos.');
             }
             $selection = selection_from_query();
-            $quote = calculate_booking_quote(
-                $connection,
-                $selection['serviceCode'],
-                $selection['length'],
-                $selection['effects'],
-                $selection['removal']
-            );
+            $quote = calculate_booking_services_quote($connection, $selection['services']);
             $statement = $connection->prepare(
                 "SELECT TIME_TO_SEC(hora_inicio) AS startSeconds,
                         duracion_minutos AS durationMinutes
@@ -865,13 +947,7 @@ try {
                 fail_request(400, 'Indica un mes y servicio válidos.');
             }
             $selection = selection_from_query();
-            $quote = calculate_booking_quote(
-                $connection,
-                $selection['serviceCode'],
-                $selection['length'],
-                $selection['effects'],
-                $selection['removal']
-            );
+            $quote = calculate_booking_services_quote($connection, $selection['services']);
 
             $timezone = new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone']);
             $monthStart = new DateTimeImmutable("$month-01", $timezone);
@@ -1091,26 +1167,26 @@ try {
         if ($route === '/appointments' && $method === 'POST') {
             require_role($tokenUser, 'client');
             $body = read_request_body();
-            $serviceCode = $body['serviceCode'] ?? null;
+            $services = $body['services'] ?? null;
+            if ($services === null && isset($body['serviceCode'])) {
+                $services = [[
+                    'serviceCode' => $body['serviceCode'],
+                    'length' => $body['length'] ?? null,
+                    'effects' => $body['effects'] ?? null,
+                    'removal' => $body['removal'] ?? null,
+                ]];
+            }
             $date = $body['date'] ?? null;
             $time = $body['time'] ?? null;
             if (
-                !is_string($serviceCode) ||
                 !is_string($date) ||
                 mexico_datetime($date) === null ||
                 !is_string($time) ||
-                !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $time) ||
-                !array_key_exists('removal', $body)
+                !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $time)
             ) {
                 fail_request(400, 'Selecciona un servicio, fecha y horario válidos.');
             }
-            $quote = calculate_booking_quote(
-                $connection,
-                $serviceCode,
-                $body['length'] ?? null,
-                $body['effects'] ?? null,
-                $body['removal']
-            );
+            $quote = calculate_booking_services_quote($connection, $services);
             $now = new DateTimeImmutable(
                 'now',
                 new DateTimeZone(CHINA_NAILS_CATALOG['schedule']['timezone'])
@@ -1157,10 +1233,11 @@ try {
                  VALUES (?, ?, ?, ?, ?, ?, ?)"
             );
             $price = (float) $quote['total'];
+            $primaryServiceCode = $quote['quotes'][0]['serviceCode'];
             $statement->bind_param(
                 'isssids',
                 $userId,
-                $serviceCode,
+                $primaryServiceCode,
                 $date,
                 $time,
                 $quote['durationMinutes'],
