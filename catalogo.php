@@ -80,7 +80,7 @@ const CHINA_NAILS_CATALOG = [
         'dayNames' => ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'],
         'closedDays' => ['domingo'],
         'openingTime' => '11:00',
-        'closingTime' => '21:00',
+        'closingTime' => '23:00',
         'slotMinutes' => 30,
     ],
 ];
